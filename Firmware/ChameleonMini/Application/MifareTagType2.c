@@ -100,8 +100,8 @@
 #define BYTES_PER_COMPAT_WRITE  16
 
 static enum {
-    UL_EV0,
-    UL_EV1,
+    TYPE_UL_EV0,
+    TYPE_UL_EV1,
     TYPE_NTAG213,
     TYPE_NTAG215,
     TYPE_NTAG216
@@ -141,7 +141,7 @@ static void AppInitCommon(void)
 void MifareUltralightAppInit(void)
 {
     /* Set up the emulation flavor */
-    TagType = UL_EV0;
+    TagType = TYPE_UL_EV0;
     /* EV0 cards have fixed size */
     PageCount = MIFARE_ULTRALIGHT_PAGES;
     /* Default values */
@@ -164,14 +164,14 @@ static void AppInitEV1Common(void)
 
 void MifareUltralightEV11AppInit(void)
 {
-    TagType = UL_EV1;
+    TagType = TYPE_UL_EV1;
     PageCount = MIFARE_ULTRALIGHT_EV11_PAGES;
     AppInitEV1Common();
 }
 
 void MifareUltralightEV12AppInit(void)
 {
-    TagType = UL_EV1;
+    TagType = TYPE_UL_EV1;
     PageCount = MIFARE_ULTRALIGHT_EV12_PAGES;
     AppInitEV1Common();
 }
@@ -211,7 +211,7 @@ void MifareUltralightAppReset(void)
 static bool VerifyAuthentication(uint8_t PageAddress)
 {
     /* No authentication for EV0 cards; always pass */
-    if (TagType < UL_EV1) {
+    if (TagType < TYPE_UL_EV1) {
         return true;
     }
     /* If authenticated, no verification needed */
@@ -289,7 +289,7 @@ static uint16_t AppProcess(uint8_t* const Buffer, uint16_t ByteCount)
             uint8_t PageLimit;
             uint8_t Offset;
             /* For EV1+ cards, ensure the wraparound is at the first protected page */
-            if (TagType >= UL_EV1 && ReadAccessProtected && !Authenticated) {
+            if (TagType >= TYPE_UL_EV1 && ReadAccessProtected && !Authenticated) {
                 PageLimit = FirstAuthenticatedPage;
             } else {
                 PageLimit = PageCount;
@@ -366,7 +366,7 @@ static uint16_t AppProcess(uint8_t* const Buffer, uint16_t ByteCount)
     }
 
     /* Processing of EV0 ends here */
-    if (TagType < UL_EV1) {
+    if (TagType < TYPE_UL_EV1) {
         /* Command not handled. Switch to idle. */
         State = STATE_IDLE;
         return ISO14443A_APP_NO_RESPONSE;
@@ -384,7 +384,7 @@ static uint16_t AppProcess(uint8_t* const Buffer, uint16_t ByteCount)
                 /* Provide hardcoded version response */
                 Buffer[0] = 0x00;
                 Buffer[1] = 0x04;
-                if (TagType == UL_EV1) {
+                if (TagType == TYPE_UL_EV1) {
                     Buffer[2] = 0x03;
                     Buffer[3] = 0x01;
                 } else {
@@ -505,7 +505,7 @@ static uint16_t AppProcess(uint8_t* const Buffer, uint16_t ByteCount)
     }
 
     /* Processing of NTAG ends here */
-    if (TagType != UL_EV1) {
+    if (TagType != TYPE_UL_EV1) {
         /* Command not handled. Switch to idle. */
         State = STATE_IDLE;
         return ISO14443A_APP_NO_RESPONSE;
