@@ -1,13 +1,14 @@
 /*
- * MifareUltralight.c
+ * MifareTagType2.c
  *
- *  Created on: 20.03.2013
- *      Author: skuser
+ *  Created on: 06.11.2026
+ *      Author: Smartsmurf
+ *  based on MifareUltralight.c by skuser
+ *           NTAG21x.c by gcammisa
+ *     This file is part of the ChameleonMini project.
  */
 
-#ifdef CONFIG_MF_ULTRALIGHT_SUPPORT
-
-#include "MifareUltralight.h"
+#include "MifareTagType2.h"
 #include "ISO14443-3A.h"
 #include "../Codec/ISO14443-2A.h"
 #include "../Memory/Memory.h"
@@ -25,7 +26,7 @@
 #define NAK_EEPROM_ERROR        0x05
 #define NAK_OTHER_ERROR         0x06
 /* NOTE: the spec is not crystal clear which error is returned */
-#define NAK_AUTH_REQUIRED       NAK_OTHER_ERROR
+#define NAK_AUTH_REQUIRED       NAK_INVALID_ARG
 #define NAK_AUTH_FAILED         NAK_OTHER_ERROR
 #define NAK_FRAME_SIZE          4
 
@@ -49,14 +50,30 @@
 #define CMD_VCSL                0x4B
 
 /* Tag memory layout; addresses and sizes in bytes */
-#define UID_CL1_ADDRESS         0x00
+#define VERSION_INFO_ADDRESS    0x00
+#define VERSION_INFO_SIZE       0x08
+#define TBO_0_ADDRESS           0x08
+#define TBO_0_SIZE              0x02
+#define TBO_1_ADDRESS           0x0A
+#define TBO_1_SIZE              0x01
+#define SIGNATURE_ADDRESS       0x0C
+#define SIGNATURE_SIZE          0x20
+#define COUNTER_0_ADDRESS       0x2C
+#define TEARING_0_ADDRESS       0x2F
+#define COUNTER_1_ADDRESS       0x30
+#define TEARING_1_ADDRESS       0x33
+#define COUNTER_2_ADDRESS       0x34
+#define TEARING_2_ADDRESS       0x37
+#define PAGE_0_ADDRESS          (MIFARE_ULTRALIGHT_HEADER_SIZE)
+#define UID_CL1_ADDRESS         (PAGE_0_ADDRESS)
 #define UID_CL1_SIZE            3
-#define UID_BCC1_ADDRESS        0x03
-#define UID_CL2_ADDRESS         0x04
+#define UID_BCC0_ADDRESS        (UID_CL1_ADDRESS + UID_CL1_SIZE)
+#define UID_BCC0_SIZE           1
+#define UID_CL2_ADDRESS         (UID_BCC0_ADDRESS + UID_BCC0_SIZE)
 #define UID_CL2_SIZE            4
-#define UID_BCC2_ADDRESS        0x08
-#define LOCK_BYTES_1_ADDRESS    0x0A
-#define LOCK_BYTES_2_ADDRESS    0x90
+#define UID_BCC1_ADDRESS        (UID_CL2_ADDRESS + UID_CL2_SIZE)
+#define UID_BCC1_SIZE           1
+#define LOCK_BYTES_1_ADDRESS    (PAGE_0_ADDRESS  + 0x0A)
 #define CONFIG_AREA_SIZE        0x10
 #define CONF_AUTH0_OFFSET       0x03
 #define CONF_ACCESS_OFFSET      0x04
@@ -82,16 +99,13 @@
 
 #define BYTES_PER_COMPAT_WRITE  16
 
-#define VERSION_INFO_LENGTH     8
-#define VERSION_OFFSET_PAGES    3
-
-#define SIGNATURE_LENGTH        32
-#define SIGNATURE_OFFSET_PAGES  5
-
 static enum {
     UL_EV0,
     UL_EV1,
-} Flavor;
+    TYPE_NTAG213,
+    TYPE_NTAG215,
+    TYPE_NTAG216
+} TagType;
 
 static enum {
     STATE_HALT,
@@ -111,6 +125,8 @@ static uint8_t FirstAuthenticatedPage;
 static bool ReadAccessProtected;
 static uint16_t CardATQAValue;
 static uint8_t CardSAKValue;
+static uint8_t PendingPassword[MIFARE_ULTRALIGHT_PWD_SIZE];
+static bool PasswordPending = false;
 
 static void AppInitCommon(void)
 {
@@ -125,7 +141,7 @@ static void AppInitCommon(void)
 void MifareUltralightAppInit(void)
 {
     /* Set up the emulation flavor */
-    Flavor = UL_EV0;
+    TagType = UL_EV0;
     /* EV0 cards have fixed size */
     PageCount = MIFARE_ULTRALIGHT_PAGES;
     /* Default values */
@@ -136,11 +152,9 @@ void MifareUltralightAppInit(void)
 
 static void AppInitEV1Common(void)
 {
-    uint8_t ConfigAreaAddress = PageCount * MIFARE_ULTRALIGHT_PAGE_SIZE - CONFIG_AREA_SIZE;
+    uint16_t ConfigAreaAddress = PAGE_0_ADDRESS + PageCount * MIFARE_ULTRALIGHT_PAGE_SIZE - CONFIG_AREA_SIZE;
     uint8_t Access;
 
-    /* Set up the emulation flavor */
-    Flavor = UL_EV1;
     /* Fetch some of the configuration into RAM */
     AppCardMemoryRead(&FirstAuthenticatedPage, ConfigAreaAddress + CONF_AUTH0_OFFSET, 1);
     AppCardMemoryRead(&Access, ConfigAreaAddress + CONF_ACCESS_OFFSET, 1);
@@ -150,14 +164,43 @@ static void AppInitEV1Common(void)
 
 void MifareUltralightEV11AppInit(void)
 {
+    TagType = UL_EV1;
     PageCount = MIFARE_ULTRALIGHT_EV11_PAGES;
     AppInitEV1Common();
 }
 
 void MifareUltralightEV12AppInit(void)
 {
+    TagType = UL_EV1;
     PageCount = MIFARE_ULTRALIGHT_EV12_PAGES;
     AppInitEV1Common();
+}
+
+void NTAG213AppInit(void) {
+    TagType = TYPE_NTAG213;
+    PageCount = NTAG213_PAGES;
+    AppInitEV1Common();
+}
+
+void NTAG215AppInit(void) {
+    TagType = TYPE_NTAG215;
+    PageCount = NTAG215_PAGES;
+    AppInitEV1Common();
+}
+
+void NTAG216AppInit(void) {
+    TagType = TYPE_NTAG216;
+    PageCount = NTAG216_PAGES;
+    AppInitEV1Common();
+}
+
+void MifareTagType2AppTask(void)
+{
+    if (PasswordPending && (State == STATE_IDLE || State == STATE_HALT)) {
+        /* handle flash writes once card is not selected. */
+        PasswordPending = false;
+        AppWorkingMemoryWrite(PendingPassword, MIFARE_ULTRALIGHT_PWD_ADDRESS, MIFARE_ULTRALIGHT_PWD_SIZE);
+    }
 }
 
 void MifareUltralightAppReset(void)
@@ -168,7 +211,7 @@ void MifareUltralightAppReset(void)
 static bool VerifyAuthentication(uint8_t PageAddress)
 {
     /* No authentication for EV0 cards; always pass */
-    if (Flavor < UL_EV1) {
+    if (TagType < UL_EV1) {
         return true;
     }
     /* If authenticated, no verification needed */
@@ -197,7 +240,7 @@ static uint8_t AppWritePage(uint8_t PageAddress, uint8_t* const Buffer)
         if (PageAddress == PAGE_LOCK_BITS || PageAddress == PAGE_OTP) {
             // OTP page and page with locks could not be resets to zero
             uint8_t PageBytes[MIFARE_ULTRALIGHT_PAGE_SIZE];
-            AppCardMemoryRead(PageBytes, PageAddress * MIFARE_ULTRALIGHT_PAGE_SIZE, MIFARE_ULTRALIGHT_PAGE_SIZE);
+            AppCardMemoryRead(PageBytes, PAGE_0_ADDRESS + PageAddress * MIFARE_ULTRALIGHT_PAGE_SIZE, MIFARE_ULTRALIGHT_PAGE_SIZE);
             // First two bytes of page with locks are not rewritable
             if (PageAddress == PAGE_LOCK_BITS) {
                 Buffer[0] = Buffer[1] = 0;
@@ -206,12 +249,23 @@ static uint8_t AppWritePage(uint8_t PageAddress, uint8_t* const Buffer)
                 Buffer[i] |= PageBytes[i];
             }
         }
-        AppCardMemoryWrite(Buffer, PageAddress * MIFARE_ULTRALIGHT_PAGE_SIZE, MIFARE_ULTRALIGHT_PAGE_SIZE);
+        AppCardMemoryWrite(Buffer, PAGE_0_ADDRESS + PageAddress * MIFARE_ULTRALIGHT_PAGE_SIZE, MIFARE_ULTRALIGHT_PAGE_SIZE);
     } else {
         /* If the chameleon is in read only mode, it silently
         * ignores any attempt to write data. */
     }
     return 0;
+}
+
+// user_pages: Anzahl der User-Seiten (ab Seite 4), also user_bytes / 4
+
+uint8_t MifareTagType2StorageSize(uint8_t user_pages) 
+{
+    uint16_t bytes = (uint16_t)user_pages * 4;
+    if (bytes == 0) return 0;
+    uint8_t n = 0;
+    while ((1u << (n + 1)) <= bytes) n++; // poor mans n = floor(log2(bytes))
+    return (uint8_t)((n << 1) | ((1u << n) != bytes));
 }
 
 /* Handles processing of MF commands */
@@ -235,7 +289,7 @@ static uint16_t AppProcess(uint8_t* const Buffer, uint16_t ByteCount)
             uint8_t PageLimit;
             uint8_t Offset;
             /* For EV1+ cards, ensure the wraparound is at the first protected page */
-            if (Flavor >= UL_EV1 && ReadAccessProtected && !Authenticated) {
+            if (TagType >= UL_EV1 && ReadAccessProtected && !Authenticated) {
                 PageLimit = FirstAuthenticatedPage;
             } else {
                 PageLimit = PageCount;
@@ -247,7 +301,7 @@ static uint16_t AppProcess(uint8_t* const Buffer, uint16_t ByteCount)
             }
             /* Read out, emulating the wraparound */
             for (Offset = 0; Offset < BYTES_PER_READ; Offset += 4) {
-                AppCardMemoryRead(&Buffer[Offset], PageAddress * MIFARE_ULTRALIGHT_PAGE_SIZE, MIFARE_ULTRALIGHT_PAGE_SIZE);
+                AppCardMemoryRead(&Buffer[Offset], PAGE_0_ADDRESS + PageAddress * MIFARE_ULTRALIGHT_PAGE_SIZE, MIFARE_ULTRALIGHT_PAGE_SIZE);
                 PageAddress++;
                 if (PageAddress == PageLimit) {
                     PageAddress = 0;
@@ -310,152 +364,230 @@ static uint16_t AppProcess(uint8_t* const Buffer, uint16_t ByteCount)
         default:
             break;
     }
-    /* Handle EV1 commands */
-    if (Flavor >= UL_EV1) {
-        switch (Cmd) {
 
-            case CMD_GET_VERSION: {
-                /* Check new dump format and get version from out of pages area (skip 3 pages of counters) */
-                AppCardMemoryRead(Buffer, (PageCount + VERSION_OFFSET_PAGES) * MIFARE_ULTRALIGHT_PAGE_SIZE, VERSION_INFO_LENGTH);
-                if (Buffer[6] != 0x0B && Buffer[6] != 0x0E) {
-                    /* Provide hardcoded version response */
-                    Buffer[0] = 0x00;
-                    Buffer[1] = 0x04;
-                    Buffer[2] = 0x03;
-                    Buffer[3] = 0x01; /**/
-                    Buffer[4] = 0x01;
-                    Buffer[5] = 0x00;
-                    Buffer[6] = PageCount == MIFARE_ULTRALIGHT_EV11_PAGES ? 0x0B : 0x0E;
-                    Buffer[7] = 0x03;
-                }
-                ISO14443AAppendCRCA(Buffer, VERSION_INFO_LENGTH);
-                return (VERSION_INFO_LENGTH + ISO14443A_CRCA_SIZE) * 8;
-            }
-
-            case CMD_FAST_READ: {
-                uint8_t StartPageAddress = Buffer[1];
-                uint8_t EndPageAddress = Buffer[2];
-                /* Validation */
-                if ((StartPageAddress > EndPageAddress) || (StartPageAddress >= PageCount) || (EndPageAddress >= PageCount)) {
-                    Buffer[0] = NAK_INVALID_ARG;
-                    return NAK_FRAME_SIZE;
-                }
-                /* Check authentication only if protection is read&write */
-                if (ReadAccessProtected) {
-                    if (!VerifyAuthentication(StartPageAddress) || !VerifyAuthentication(EndPageAddress)) {
-                        Buffer[0] = NAK_AUTH_REQUIRED;
-                        return NAK_FRAME_SIZE;
-                    }
-                }
-                /* NOTE: With the current implementation, reading the password out is possible. */
-                ByteCount = (EndPageAddress - StartPageAddress + 1) * MIFARE_ULTRALIGHT_PAGE_SIZE;
-                AppCardMemoryRead(Buffer, StartPageAddress * MIFARE_ULTRALIGHT_PAGE_SIZE, ByteCount);
-                ISO14443AAppendCRCA(Buffer, ByteCount);
-                return (ByteCount + ISO14443A_CRCA_SIZE) * 8;
-            }
-
-            case CMD_PWD_AUTH: {
-                uint8_t ConfigAreaAddress = PageCount * MIFARE_ULTRALIGHT_PAGE_SIZE - CONFIG_AREA_SIZE;
-                uint8_t Password[4];
-
-                /* Save password */
-                AppWorkingMemoryWrite(Buffer+1, MIFARE_ULTRALIGHT_PWD_ADDRESS, MIFARE_ULTRALIGHT_PWD_SIZE);
-
-                /* Verify value and increment authentication attempt counter */
-                if (!AuthCounterIncrement()) {
-                    /* Too many failed attempts */
-                    Buffer[0] = NAK_AUTH_FAILED;
-                    return NAK_FRAME_SIZE;
-                }
-                /* Read and compare the password */
-                AppCardMemoryRead(Password, ConfigAreaAddress + CONF_PASSWORD_OFFSET, 4);
-                if (Password[0] != Buffer[1] || Password[1] != Buffer[2] || Password[2] != Buffer[3] || Password[3] != Buffer[4]) {
-                    Buffer[0] = NAK_AUTH_FAILED;
-                    return NAK_FRAME_SIZE;
-                }
-                /* Authenticate the user */
-                AuthCounterReset();
-                Authenticated = 1;
-                /* Send the PACK value back */
-                AppCardMemoryRead(Buffer, ConfigAreaAddress + CONF_PACK_OFFSET, 2);
-                ISO14443AAppendCRCA(Buffer, 2);
-                return (2 + ISO14443A_CRCA_SIZE) * 8;
-            }
-
-            case CMD_READ_CNT: {
-                uint8_t CounterId = Buffer[1];
-                /* Validation */
-                if (CounterId > CNT_MAX) {
-                    Buffer[0] = NAK_INVALID_ARG;
-                    return NAK_FRAME_SIZE;
-                }
-                /* Returned counter length is 3 bytes */
-                AppCardMemoryRead(Buffer, (PageCount + CounterId) * MIFARE_ULTRALIGHT_PAGE_SIZE, CNT_SIZE);
-                ISO14443AAppendCRCA(Buffer, CNT_SIZE);
-                return (3 + ISO14443A_CRCA_SIZE) * 8;
-            }
-
-            case CMD_INCREMENT_CNT: {
-                uint8_t CounterId = Buffer[1];
-                uint32_t Addend = ((uint32_t)Buffer[2]) | ((uint32_t)Buffer[3] << 8) | ((uint32_t)Buffer[4] << 16);
-                uint32_t Counter = 0;
-                /* Validation */
-                if (CounterId > CNT_MAX) {
-                    Buffer[0] = NAK_INVALID_ARG;
-                    return NAK_FRAME_SIZE;
-                }
-                /* Read the value out */
-                AppCardMemoryRead(&Counter, (PageCount + CounterId) * MIFARE_ULTRALIGHT_PAGE_SIZE, CNT_SIZE);
-                /* Add and check for overflow */
-                Counter += Addend;
-                if (Counter > CNT_MAX_VALUE) {
-                    Buffer[0] = NAK_CTR_ERROR;
-                    return NAK_FRAME_SIZE;
-                }
-                /* Update memory */
-                AppCardMemoryWrite(&Counter, (PageCount + CounterId) * MIFARE_ULTRALIGHT_PAGE_SIZE, CNT_SIZE);
-                Buffer[0] = ACK_VALUE;
-                return ACK_FRAME_SIZE;
-            }
-
-            case CMD_READ_SIG: {
-                /* Check new dump format and get signature from out of pages area (skip 3 pages of counters, 2 pages VERSION) */
-                AppCardMemoryRead(Buffer, (PageCount + SIGNATURE_OFFSET_PAGES) * MIFARE_ULTRALIGHT_PAGE_SIZE, SIGNATURE_LENGTH);
-                uint8_t zeros[SIGNATURE_LENGTH];
-                memset(zeros, 0, SIGNATURE_LENGTH);
-                if (memcmp(Buffer, zeros, SIGNATURE_LENGTH) == 0) {
-                    /* Hardcoded response */
-                    memset(Buffer, 0xCA, SIGNATURE_LENGTH);
-                }
-                ISO14443AAppendCRCA(Buffer, SIGNATURE_LENGTH);
-                return (SIGNATURE_LENGTH + ISO14443A_CRCA_SIZE) * 8;
-            }
-
-            case CMD_CHECK_TEARING_EVENT: {
-                uint8_t CounterId = Buffer[1];
-                /* Read tearing flag from counter pages of new dump format */
-                AppCardMemoryRead(Buffer, (PageCount + CounterId) * MIFARE_ULTRALIGHT_PAGE_SIZE + CNT_SIZE, TEARING_SIZE);
-                /* Hardcoded response */
-                if (Buffer[0] == 0) {
-                    Buffer[0] = 0xBD;
-                }
-                ISO14443AAppendCRCA(Buffer, TEARING_SIZE);
-                return (1 + ISO14443A_CRCA_SIZE) * 8;
-            }
-
-            case CMD_VCSL: {
-                uint8_t ConfigAreaAddress = PageCount * MIFARE_ULTRALIGHT_PAGE_SIZE - CONFIG_AREA_SIZE;
-                /* Input is ignored completely */
-                /* Read out the value */
-                AppCardMemoryRead(Buffer, ConfigAreaAddress + CONF_VCTID_OFFSET, 1);
-                ISO14443AAppendCRCA(Buffer, 1);
-                return (1 + ISO14443A_CRCA_SIZE) * 8;
-            }
-
-            default:
-                break;
-        }
+    /* Processing of EV0 ends here */
+    if (TagType < UL_EV1) {
+        /* Command not handled. Switch to idle. */
+        State = STATE_IDLE;
+        return ISO14443A_APP_NO_RESPONSE;
     }
+
+    /* Handle common EV1+NTAG commands */
+    switch (Cmd) {
+
+        case CMD_GET_VERSION: {
+            /* Check new dump format and get version from out of pages area (skip 3 pages of counters) */
+            AppCardMemoryRead(Buffer, VERSION_INFO_ADDRESS, VERSION_INFO_SIZE);
+
+            if (Buffer[1] == 0x00 && Buffer[2] == 0x00) {
+                uint8_t user_pages;
+                /* Provide hardcoded version response */
+                Buffer[0] = 0x00;
+                Buffer[1] = 0x04;
+                if (TagType == UL_EV1) {
+                    Buffer[2] = 0x03;
+                    Buffer[3] = 0x01;
+                } else {
+                    Buffer[2] = 0x04;
+                    Buffer[3] = 0x02;
+                }
+                Buffer[4] = 0x01;
+                Buffer[5] = 0x00;
+                user_pages = PageCount - (PageCount == MIFARE_ULTRALIGHT_EV11_PAGES ? 8 : 9);
+                Buffer[6] = MifareTagType2StorageSize(user_pages);
+                Buffer[7] = 0x03;
+            }
+            ISO14443AAppendCRCA(Buffer, VERSION_INFO_SIZE);
+            return (VERSION_INFO_SIZE + ISO14443A_CRCA_SIZE) * 8;
+        }
+
+        case CMD_FAST_READ: {
+            uint8_t StartPageAddress = Buffer[1];
+            uint8_t EndPageAddress = Buffer[2];
+            /* Validation */
+            if ((StartPageAddress > EndPageAddress) || 
+                (StartPageAddress >= PageCount) || 
+                (EndPageAddress >= PageCount) || 
+                ((EndPageAddress - StartPageAddress + 1) > (CODEC_BUFFER_SIZE / 4))) {
+                Buffer[0] = NAK_INVALID_ARG;
+                return NAK_FRAME_SIZE;
+            }
+            /* Check authentication only if protection is read&write */
+            if (ReadAccessProtected) {
+                if (!VerifyAuthentication(StartPageAddress) || !VerifyAuthentication(EndPageAddress)) {
+                    Buffer[0] = NAK_AUTH_REQUIRED;
+                    return NAK_FRAME_SIZE;
+                }
+            }
+            /* NOTE: With the current implementation, reading the password out is possible. */
+            ByteCount = (EndPageAddress - StartPageAddress + 1) * MIFARE_ULTRALIGHT_PAGE_SIZE;
+            AppCardMemoryRead(Buffer, PAGE_0_ADDRESS + StartPageAddress * MIFARE_ULTRALIGHT_PAGE_SIZE, ByteCount);
+            ISO14443AAppendCRCA(Buffer, ByteCount);
+            return (ByteCount + ISO14443A_CRCA_SIZE) * 8;
+        }
+
+        case CMD_PWD_AUTH: {
+            uint16_t ConfigAreaAddress = PAGE_0_ADDRESS + PageCount * MIFARE_ULTRALIGHT_PAGE_SIZE - CONFIG_AREA_SIZE;
+            uint8_t Password[4];
+
+            /* Remember password to be retrieved via terminal. The flash write takes
+             * far too long to do it here; it is deferred to MifareTagType2AppTask(). */
+            memcpy(PendingPassword, Buffer + 1, MIFARE_ULTRALIGHT_PWD_SIZE);
+            PasswordPending = true;
+
+            /* Verify value and increment authentication attempt counter */
+            if (!AuthCounterIncrement()) {
+                /* Too many failed attempts */
+                Buffer[0] = NAK_CTR_ERROR;
+                return NAK_FRAME_SIZE;
+            }
+            /* Read and compare the password */
+            AppCardMemoryRead(Password, ConfigAreaAddress + CONF_PASSWORD_OFFSET, 4);
+            if (Password[0] != Buffer[1] || Password[1] != Buffer[2] || Password[2] != Buffer[3] || Password[3] != Buffer[4]) {
+                Buffer[0] = NAK_AUTH_FAILED;
+                return NAK_FRAME_SIZE;
+            }
+            /* Authenticate the user */
+            AuthCounterReset();
+            Authenticated = 1;
+            /* Send the PACK value back */
+            AppCardMemoryRead(Buffer, ConfigAreaAddress + CONF_PACK_OFFSET, 2);
+            ISO14443AAppendCRCA(Buffer, 2);
+            return (2 + ISO14443A_CRCA_SIZE) * 8;
+        }
+
+        case CMD_READ_CNT: {
+            uint8_t CounterId = Buffer[1];
+            uint8_t addr = 0;
+
+            /* NTAG only handles counter = 2 */
+            if( (TagType >= TYPE_NTAG213) && (CounterId != 2) ) {
+                Buffer[0] = NAK_INVALID_ARG;
+                return NAK_FRAME_SIZE;
+            }
+
+            /* Validation */
+            switch( CounterId ) {
+                case 0:
+                    addr = COUNTER_0_ADDRESS;
+                    break;
+                case 1:
+                    addr = COUNTER_1_ADDRESS;
+                    break;
+                case 2:
+                    addr = COUNTER_2_ADDRESS;
+                    break;
+                default:
+                    Buffer[0] = NAK_INVALID_ARG;
+                    return NAK_FRAME_SIZE;
+            }
+            /* Returned counter length is 3 bytes */
+            AppCardMemoryRead(Buffer, addr, CNT_SIZE);
+            ISO14443AAppendCRCA(Buffer, CNT_SIZE);
+            return (3 + ISO14443A_CRCA_SIZE) * 8;
+        }
+
+        case CMD_READ_SIG: {
+            /* Check new dump format and get signature from out of pages area (skip 3 pages of counters, 2 pages VERSION) */
+            AppCardMemoryRead(Buffer, SIGNATURE_ADDRESS, SIGNATURE_SIZE);
+            uint8_t zeros[SIGNATURE_SIZE];
+            memset(zeros, 0, SIGNATURE_SIZE);
+            if (memcmp(Buffer, zeros, SIGNATURE_SIZE) == 0) {
+                /* Hardcoded response */
+                memset(Buffer, 0xCA, SIGNATURE_SIZE);
+            }
+            ISO14443AAppendCRCA(Buffer, SIGNATURE_SIZE);
+            return (SIGNATURE_SIZE + ISO14443A_CRCA_SIZE) * 8;
+        }
+        default:
+            break;
+
+    }
+
+    /* Processing of NTAG ends here */
+    if (TagType != UL_EV1) {
+        /* Command not handled. Switch to idle. */
+        State = STATE_IDLE;
+        return ISO14443A_APP_NO_RESPONSE;
+    }
+    
+    /* Handle exclusive EV1 commands */
+    switch (Cmd) {
+        case CMD_INCREMENT_CNT: {
+            uint8_t CounterId = Buffer[1];
+            uint32_t Addend = ((uint32_t)Buffer[2]) | ((uint32_t)Buffer[3] << 8) | ((uint32_t)Buffer[4] << 16);
+            uint32_t Counter = 0;
+            uint8_t addr = 0;
+            /* Validation */
+            if (CounterId > CNT_MAX) {
+                Buffer[0] = NAK_INVALID_ARG;
+                return NAK_FRAME_SIZE;
+            }
+            switch( CounterId ) {
+                case 0:
+                    addr = COUNTER_0_ADDRESS;
+                    break;
+                case 1:
+                    addr = COUNTER_1_ADDRESS;
+                    break;
+                case 2:
+                    addr = COUNTER_2_ADDRESS;
+                    break;
+                default:
+                    Buffer[0] = NAK_INVALID_ARG;
+                    return NAK_FRAME_SIZE;
+            }
+            /* Read the value out */
+            AppCardMemoryRead(&Counter, addr, CNT_SIZE);
+            /* Add and check for overflow */
+            Counter += Addend;
+            if (Counter > CNT_MAX_VALUE) {
+                Buffer[0] = NAK_CTR_ERROR;
+                return NAK_FRAME_SIZE;
+            }
+            /* Update memory */
+            AppCardMemoryWrite(&Counter, addr, CNT_SIZE);
+            Buffer[0] = ACK_VALUE;
+            return ACK_FRAME_SIZE;
+        }
+        case CMD_VCSL: {
+            uint16_t ConfigAreaAddress = PAGE_0_ADDRESS + PageCount * MIFARE_ULTRALIGHT_PAGE_SIZE - CONFIG_AREA_SIZE;
+            /* Input is ignored completely */
+            /* Read out the value */
+            AppCardMemoryRead(Buffer, ConfigAreaAddress + CONF_VCTID_OFFSET, 1);
+            ISO14443AAppendCRCA(Buffer, 1);
+            return (1 + ISO14443A_CRCA_SIZE) * 8;
+        }
+        case CMD_CHECK_TEARING_EVENT: {
+            uint8_t CounterId = Buffer[1];
+            uint8_t addr = 0;
+            /* Read tearing flag from counter pages of new dump format */
+            switch (CounterId) {
+                case 0:
+                    addr = TEARING_0_ADDRESS;
+                    break;
+                case 1:
+                    addr = TEARING_1_ADDRESS;
+                    break;
+                case 2:
+                    addr = TEARING_2_ADDRESS;
+                    break;
+                default:
+                    Buffer[0] = NAK_INVALID_ARG;
+                    return NAK_FRAME_SIZE;
+            }
+            AppCardMemoryRead(Buffer, addr, TEARING_SIZE);
+            /* Hardcoded response */
+            if (Buffer[0] == 0) {
+                Buffer[0] = 0xBD;
+            }
+            ISO14443AAppendCRCA(Buffer, TEARING_SIZE);
+            return (1 + ISO14443A_CRCA_SIZE) * 8;
+        }
+        default:
+            break;
+    }
+
     /* Command not handled. Switch to idle. */
     State = STATE_IDLE;
     return ISO14443A_APP_NO_RESPONSE;
@@ -556,13 +688,13 @@ void MifareUltralightGetUid(ConfigurationUidType Uid)
 void MifareUltralightSetUid(ConfigurationUidType Uid)
 {
     /* Calculate check bytes and write everything into memory */
-    uint8_t BCC1 = ISO14443A_UID0_CT ^ Uid[0] ^ Uid[1] ^ Uid[2];
-    uint8_t BCC2 = Uid[3] ^ Uid[4] ^ Uid[5] ^ Uid[6];
+    uint8_t BCC0 = ISO14443A_UID0_CT ^ Uid[0] ^ Uid[1] ^ Uid[2];
+    uint8_t BCC1 = Uid[3] ^ Uid[4] ^ Uid[5] ^ Uid[6];
 
     AppCardMemoryWrite(&Uid[0], UID_CL1_ADDRESS, UID_CL1_SIZE);
-    AppCardMemoryWrite(&BCC1, UID_BCC1_ADDRESS, ISO14443A_CL_BCC_SIZE);
+    AppCardMemoryWrite(&BCC0, UID_BCC0_ADDRESS, ISO14443A_CL_BCC_SIZE);
     AppCardMemoryWrite(&Uid[UID_CL1_SIZE], UID_CL2_ADDRESS, UID_CL2_SIZE);
-    AppCardMemoryWrite(&BCC2, UID_BCC2_ADDRESS, ISO14443A_CL_BCC_SIZE);
+    AppCardMemoryWrite(&BCC1, UID_BCC1_ADDRESS, ISO14443A_CL_BCC_SIZE);
 }
 
 void MifareUltralightGetAtqa(uint16_t * Atqa)
@@ -584,5 +716,3 @@ void MifareUltralightSetSak(uint8_t Sak)
 {
     CardSAKValue = Sak;
 }
-
-#endif /* Compilation support */
